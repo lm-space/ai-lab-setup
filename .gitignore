@@ -8,3 +8,7 @@ dist/
 .DS_Store
 .vite/
 artifacts/
+
+# Local planning and inspiration notes (any directory)
+idea.md
+inspirations.md

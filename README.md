@@ -29,7 +29,7 @@ Open http://127.0.0.1:4186. In Settings, choose Ollama and load an installed too
 ## Repository
 
 - `projects/understanding-ai/`: independently runnable first project.
-- `idea.md`: direction for the broader collection.
+- Project roadmaps live alongside each project under `docs/`.
 - Future projects may use TypeScript, Python, Go, or Rust, with SQLite by default and Docker Postgres where required. The imported first project currently uses local JSON files and a MiniLM vector index.
 
 This is an educational local development application. Its trace shows this harness's observable behavior, not ChatGPT's private implementation or hidden reasoning. Model output, tool availability, and provider capabilities vary.
