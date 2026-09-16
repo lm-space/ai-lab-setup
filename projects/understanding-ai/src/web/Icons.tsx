@@ -29,14 +29,9 @@ export function IconNewChat() {
 
 export function IconSettings() {
   return (
-    <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden>
-      <circle cx="9" cy="9" r="2.2" stroke="currentColor" strokeWidth="1.5" />
-      <path
-        d="M9 2.4v1.4M9 14.2v1.4M2.4 9h1.4M14.2 9h1.4M4.3 4.3l1 .9M12.7 12.8l1 .9M13.7 4.3l-1 .9M5.3 12.8l-1 .9"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-      />
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M9.5 3h5l.6 2.5 1.7 1 2.5-.7 2.5 4.4-1.9 1.8v2l1.9 1.8-2.5 4.3-2.5-.7-1.7 1-.6 2.6h-5l-.6-2.6-1.7-1-2.5.7-2.5-4.3L4.1 14v-2l-1.9-1.8 2.5-4.4 2.5.7 1.7-1L9.5 3Z" transform="translate(1 0) scale(.92)" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+      <circle cx="12" cy="12" r="3.2" stroke="currentColor" strokeWidth="1.6" />
     </svg>
   );
 }

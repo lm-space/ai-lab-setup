@@ -1,3 +1,4 @@
+import { trace, tracedOperation } from "./trace.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -182,7 +183,7 @@ export async function ingestFile(
     note: cls.shape === "table" ? "tabular → kb__table + semantic search" : "prose → kb__search",
   });
 
-  const extracted = await extractText(fileName, bytes, log);
+  const extracted = await tracedOperation("Parse uploaded content", { fileName, parser: cls.parser }, { category: "knowledge", callType: "local" }, () => extractText(fileName, bytes, log));
   await log("kb_extracted", {
     fileName,
     chars: extracted.text.length,
@@ -218,7 +219,7 @@ export async function ingestFile(
   };
   docs.push(doc);
   chunks.push(...chunkRows);
-  await persist();
+  await tracedOperation("Write vectors and metadata", { store: "data/kb/chunks.json", chunks: chunkRows.length, dimensions: vectors[0]?.length || 0 }, { category: "knowledge", callType: "local" }, persist);
   await log("kb_upsert", {
     id,
     fileName,
@@ -241,7 +242,8 @@ export async function deleteDoc(id: string): Promise<void> {
 export async function search(query: string, k: number) {
   const { chunks } = await load();
   if (!chunks.length) return { hits: [], note: "knowledge base is empty — upload files first" };
-  const [q] = await embedAll([query], async () => {});
+  const [q] = await embedAll([query], (title, payload) => trace(title, payload, { category: "knowledge", callType: "local" }));
+  const started = performance.now();
   const scored = chunks
     .map((c) => ({
       id: c.id,
@@ -252,6 +254,7 @@ export async function search(query: string, k: number) {
     }))
     .sort((a, b) => b.score - a.score)
     .slice(0, k);
+  await trace("Vector similarity search", { query, scanned: chunks.length, k, hits: scored, algorithm: "cosine similarity over normalized MiniLM vectors", store: "local JSON vector index" }, { category: "knowledge", callType: "local", phase: "complete", durationMs: Math.round(performance.now() - started) });
   return { hits: scored };
 }
 
@@ -367,17 +370,23 @@ async function embedAll(texts: string[], log: Log): Promise<number[][]> {
     n: texts.length,
     note: "local embeddings, no extra API key",
   });
+  const started = performance.now();
   const { pipeline, env } = await import("@xenova/transformers");
   env.cacheDir = join(ROOT, "models");
   env.allowRemoteModels = true;
   if (!extractor) {
-    extractor = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
+    extractor = await tracedOperation("Load local embedding model", { model: "Xenova/all-MiniLM-L6-v2", cache: "data/kb/models", note: "On a cache miss the library downloads model assets. Asset lifecycle below is library-reported, not an HTTP packet capture." }, { category: "knowledge", callType: "local" }, async () => pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2", {
+      progress_callback: (progress: any) => {
+        if (["initiate", "download", "done", "ready"].includes(progress.status)) void log("kb_model_asset", { ...progress, observation: "Embedding library asset lifecycle; cached files may skip downloading" });
+      },
+    }));
   }
   const out: number[][] = [];
   for (const t of texts) {
     const tensor = await extractor(t.slice(0, 4000), { pooling: "mean", normalize: true });
     out.push(Array.from(tensor.data as Float32Array));
   }
+  await trace("Local embedding computation complete", { model: "MiniLM", count: texts.length, dimensions: out[0]?.length || 0 }, { category: "knowledge", callType: "local", phase: "complete", durationMs: Math.round(performance.now() - started) });
   await log("kb_embed_done", { n: out.length, dim: out[0]?.length || 0, hash: createHash("sha1").update(texts[0] || "").digest("hex").slice(0, 8) });
   return out;
 }

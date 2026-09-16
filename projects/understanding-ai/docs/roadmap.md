@@ -10,8 +10,8 @@
 
 ## Next: explain every boundary
 
-1. Annotate each trace event with a plain-language explanation and elapsed duration.
-2. Display discovered tool schemas, connection states and skill instructions in dedicated inspector panels.
+1. Expand the new event explanations and durations with guided exercises.
+2. Extend the implemented connection discovery, skill settings and payload inspector with capability validation.
 3. Add explicit tool permission/approval policies, runtime argument validation and tool timeouts.
 4. Add cancellation, token/cost budgets, retry policies and context-window inspection.
 5. Replace JSON state with SQLite migrations and durable run records.

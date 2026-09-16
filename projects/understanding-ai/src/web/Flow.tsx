@@ -26,7 +26,7 @@ export function Flow({ snap }: { snap: FlowSnap | null }) {
   }, []);
 
   const layout = useMemo(() => {
-    const nodes = snap?.nodes || [];
+    const nodes = (snap?.nodes || []).map((node) => node.id === "user" ? { ...node, label: "User App" } : node);
     const maxCol = Math.max(0, ...nodes.map((n) => n.col));
     const maxRow = Math.max(0, ...nodes.map((n) => n.row));
     const padX = 24;
@@ -38,15 +38,19 @@ export function Flow({ snap }: { snap: FlowSnap | null }) {
     const gapX = maxCol === 0 ? 0 : (usableW - nw) / maxCol;
     const gapY = maxRow === 0 ? 0 : (usableH - nh) / maxRow;
     const pos = new Map<string, Pos>();
+    const nextRow = new Map<number, number>();
     for (const n of nodes) {
+      const row = Math.max(n.row, nextRow.get(n.col) || 0);
+      nextRow.set(n.col, row + 1);
       pos.set(n.id, {
         x: padX + n.col * gapX,
-        y: padY + n.row * Math.max(gapY, 64),
+        y: padY + row * Math.max(gapY, 64),
         w: nw,
         h: nh,
       });
     }
-    return { pos, nw, nh };
+    const height = Math.max(size.h, ...[...pos.values()].map((p) => p.y + p.h + padY));
+    return { pos, nw, nh, height };
   }, [snap, size]);
 
   if (!snap || snap.nodes.length === 0) {
@@ -59,7 +63,7 @@ export function Flow({ snap }: { snap: FlowSnap | null }) {
 
   return (
     <div className="flowWrap" ref={wrap}>
-      <svg className="flowSvg" viewBox={`0 0 ${size.w} ${size.h}`}>
+      <svg className="flowSvg" style={{ height: layout.height, position: "relative", display: "block" }} viewBox={`0 0 ${size.w} ${layout.height}`}>
         {snap.edges.map((e, i) => {
           const a = layout.pos.get(e.from);
           const b = layout.pos.get(e.to);
@@ -92,7 +96,7 @@ export function Flow({ snap }: { snap: FlowSnap | null }) {
                 {n.kind}
               </text>
               <text className="nlabel" x={10} y={30}>
-                {n.label.slice(0, 18)}
+                {(n.id === "user" ? "User App" : n.label).slice(0, 18)}
               </text>
               {n.sub ? (
                 <text className="nsub" x={10} y={44}>

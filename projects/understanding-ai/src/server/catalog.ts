@@ -1,6 +1,7 @@
 import type { McpPreset } from "../shared/types.ts";
 
 export const MCP_PRESETS: McpPreset[] = [
+  { id: "lab-demo", name: "Lab demo tools", blurb: "Bundled local MCP server: add numbers or echo a message. No downloads or keys.", transport: "stdio", command: process.execPath, args: [new URL("../../scripts/demo-mcp.mjs", import.meta.url).pathname] },
   {
     id: "fetch",
     name: "Fetch",

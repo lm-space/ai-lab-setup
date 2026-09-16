@@ -1,3 +1,5 @@
+import { withTrace, tracedOperation } from "./trace.ts";
+import type { TraceMeta } from "../shared/types.ts";
 import { randomUUID } from "node:crypto";
 import { resolveSkills } from "../shared/skills.ts";
 import { SYSTEM_PROMPT } from "./catalog.ts";
@@ -54,11 +56,13 @@ export class Graph {
 
 export async function runSession(opts: {
   chatId: string;
+  runId?: string;
   existing?: ChatRecord | null;
   userText: string;
   settings: LabSettings;
   emit: Emit;
 }) {
+  const runId = opts.runId || randomUUID();
   const g = new Graph();
   let seq = opts.existing?.events.length || 0;
   let round = 0;
@@ -71,8 +75,11 @@ export async function runSession(opts: {
     lane: TraceEvent["lane"],
     payload?: unknown,
     detail?: string,
+    meta: TraceMeta = {},
   ) => {
     const ev: TraceEvent = {
+      ...meta,
+      runId,
       id: randomUUID(),
       t: Date.now(),
       seq: seq++,
@@ -88,6 +95,7 @@ export async function runSession(opts: {
     await opts.emit({ type: "event", event: ev });
   };
 
+  return withTrace((title, payload, meta) => emitEvent(meta.category === "network" ? "network" : "operation", title, meta.category === "network" ? "llm" : meta.category === "knowledge" ? "kb" : "agent", payload, undefined, meta), async () => {
   const userMsg: ChatMessage = {
     id: randomUUID(),
     role: "user",
@@ -97,7 +105,7 @@ export async function runSession(opts: {
   messages.push(userMsg);
   await opts.emit({ type: "chat", id: userMsg.id, role: "user", content: opts.userText, done: true });
 
-  g.add("user", "Chat", "actor", 0, "user message", 0);
+  g.add("user", "User App", "actor", 0, "user message", 0);
   g.add("agent", "Agent Code", "compute", 1, "TypeScript loop", 0);
   g.add("llm", "LLM API", "model", 2, opts.settings.model, 0);
   g.add("mcp", "MCP bus", "data", 3, "connecting", 0);
@@ -105,7 +113,7 @@ export async function runSession(opts: {
   g.edge("user", "agent", "POST /chat");
   g.edge("agent", "kb", "kb tools");
   g.highlight(["user", "agent"]);
-  await emitEvent("user_in", "User message received", "parent", {
+  await emitEvent("user_in", "User message received", "user-app", {
     chatId: opts.chatId,
     text: opts.userText,
   });
@@ -239,7 +247,7 @@ export async function runSession(opts: {
           }
         },
         log: (title, payload) => {
-          void emitEvent("llm_wire", title, "llm", payload);
+          return emitEvent("llm_wire", title, "llm", payload);
         },
       });
 
@@ -337,9 +345,9 @@ export async function runSession(opts: {
 
         let result: unknown;
         try {
-          result = isKb
-            ? await runKbTool(known.name, tc.input)
-            : await callMcp(handles, tools, tc.name, tc.input);
+          result = await tracedOperation(`Execute ${known.qualified}`, { arguments: tc.input, server: known.serverId }, {
+            category: "tools", callType: isKb || handles.find((h) => h.id === known.serverId)?.transport === "stdio" ? "local" : "external", target: known.qualified,
+          }, () => isKb ? runKbTool(known.name, tc.input) : callMcp(handles, tools, tc.name, tc.input));
         } catch (err) {
           result = { error: String(err) };
         }
@@ -356,15 +364,16 @@ export async function runSession(opts: {
           isKb ? "kb" : "mcp",
           result,
         );
-        toolResults.push({ tc, result, isError: false });
+        toolResults.push({ tc, result, isError: !!(result && typeof result === "object" && ((result as any).error || (result as any).isError)) });
       }
 
       if (opts.settings.provider === "anthropic") {
         anth.push({
           role: "user",
-          content: toolResults.map(({ tc, result }) => ({
+          content: toolResults.map(({ tc, result, isError }) => ({
             type: "tool_result",
             tool_use_id: tc.id,
+            is_error: isError,
             content: stringifyResult(result),
           })),
         });
@@ -401,6 +410,8 @@ export async function runSession(opts: {
       done: true,
     });
 
+    await closeMcps(handles);
+    handles = [];
     const rec: ChatRecord = {
       id: opts.chatId,
       title: titleFrom(messages),
@@ -411,17 +422,20 @@ export async function runSession(opts: {
       messages,
       events,
     };
-    await saveChat(rec);
     g.highlight(["user", "agent"]);
-    await emitEvent("persist", "Chat + full trace saved locally", "agent", {
-      chatId: rec.id,
-      eventCount: events.length,
-      messageCount: messages.length,
-    });
+    const persisted: TraceEvent = {
+      id: randomUUID(), runId, t: Date.now(), seq: seq++, round, kind: "persist",
+      title: "Chat + complete server trace saved locally", lane: "agent", category: "agent", callType: "local", phase: "complete",
+      payload: { chatId: rec.id, eventCount: events.length + 1, messageCount: messages.length }, flow: g.snap(),
+    };
+    events.push(persisted);
+    await saveChat(rec);
+    await opts.emit({ type: "event", event: persisted });
     await opts.emit({ type: "done", chatId: rec.id });
   } finally {
     await closeMcps(handles);
   }
+  });
 }
 
 type ToolCallLike = { id: string; name: string; input: Record<string, unknown> };

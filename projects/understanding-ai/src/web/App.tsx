@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Flow } from "./Flow";
-import { SKILLS } from "../shared/skills";
+import { SettingsDialog } from "./SettingsDialog";
+import { browserFetch } from "./network";
+import { TraceConsole } from "./TraceConsole";
 import { IconHistory, IconLibrary, IconNewChat, IconSettings, IconUpload } from "./Icons";
 import { Markdown } from "./Markdown";
 import type {
@@ -65,7 +67,7 @@ export function App() {
     mcps: [],
     models: {},
   });
-  const [liveModels, setLiveModels] = useState<string[]>([]);
+  const [liveModels, setLiveModels] = useState<Record<string, string[]>>({});
   const [chatId, setChatId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [events, setEvents] = useState<TraceEvent[]>([]);
@@ -80,7 +82,7 @@ export function App() {
   const [drag, setDrag] = useState(false);
   const [history, setHistory] = useState<{ id: string; title: string; updatedAt: number; model: string; preview: string }[]>([]);
   const bottom = useRef<HTMLDivElement>(null);
-  const tl = useRef<HTMLDivElement>(null);
+
   const fileRef = useRef<HTMLInputElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
 
@@ -89,7 +91,7 @@ export function App() {
   }, [settings]);
 
   useEffect(() => {
-    fetch("/api/catalog")
+    request("/api/catalog")
       .then((r) => r.json())
       .then((c) => {
         setCatalog(c);
@@ -112,9 +114,6 @@ export function App() {
     bottom.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  useEffect(() => {
-    tl.current?.scrollTo({ top: tl.current.scrollHeight, behavior: "smooth" });
-  }, [events.length]);
 
   useEffect(() => {
     const el = taRef.current;
@@ -134,15 +133,17 @@ export function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const flow = (events.find((event) => event.id === openStep) || events.at(-1))?.flow || null;
+  const flow = (events.find((event) => event.id === openStep && event.flow.nodes.length) || [...events].reverse().find((event) => event.flow.nodes.length))?.flow || null;
   const models = useMemo(() => {
     const fb = catalog.models[settings.provider] || [];
-    return [...new Set([...liveModels, ...fb])];
+    return [...new Set([...(liveModels[settings.provider] || []), ...fb])];
   }, [catalog, liveModels, settings.provider]);
 
+  const request = browserFetch(pushEvent);
+
   function pushEvent(ev: TraceEvent) {
-    setEvents((cur) => [...cur, ev]);
-    setOpenStep(ev.id);
+    setEvents((cur) => [...cur, ev].sort((a, b) => a.t - b.t));
+
   }
 
   function applyFrame(frame: SseFrame) {
@@ -186,7 +187,7 @@ export function App() {
 
   async function refreshDocs() {
     try {
-      const r = await fetch("/api/kb").then((x) => x.json());
+      const r = await request("/api/kb").then((x) => x.json());
       setDocs(r.docs || []);
     } catch {
       /* api not up yet */
@@ -202,12 +203,12 @@ export function App() {
   }
 
   async function loadHistoryList() {
-    const rows = await fetch("/api/chats").then((r) => r.json());
+    const rows = await request("/api/chats").then((r) => r.json());
     setHistory(rows);
   }
 
   async function openChat(id: string) {
-    const rec = (await fetch(`/api/chats/${id}`).then((r) => r.json())) as ChatRecord;
+    const rec = (await request(`/api/chats/${id}`).then((r) => r.json())) as ChatRecord;
     setChatId(rec.id);
     setMessages(rec.messages);
     setEvents(rec.events);
@@ -216,13 +217,14 @@ export function App() {
   }
 
   async function fetchModels() {
-    const res = await fetch("/api/models", {
+    const res = await request("/api/models", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ provider: settings.provider, apiKey: settings.apiKey }),
     });
     const json = await res.json();
-    setLiveModels(json.models || []);
+    for (const event of json.events || []) pushEvent(event);
+    setLiveModels((current) => ({ ...current, [settings.provider]: json.models || [] }));
     if (json.models?.[0] && !json.models.includes(settings.model)) {
       setSettings((s) => ({ ...s, model: json.models[0] }));
     }
@@ -233,11 +235,12 @@ export function App() {
     if (!list.length) return;
     setBusy(true);
     setErr("");
+    setOpenStep(null);
     try {
       for (const file of list) {
         const body = new FormData();
         body.append("file", file);
-        const res = await fetch("/api/kb/upload", { method: "POST", body });
+        const res = await request("/api/kb/upload", { method: "POST", body });
         if (!res.ok && !res.headers.get("content-type")?.includes("text/event-stream")) {
           const j = await res.json().catch(() => ({ error: res.statusText }));
           throw new Error(j.error || "upload failed");
@@ -253,7 +256,7 @@ export function App() {
   }
 
   async function removeDoc(id: string) {
-    await fetch(`/api/kb/${id}`, { method: "DELETE" });
+    await request(`/api/kb/${id}`, { method: "DELETE" });
     await refreshDocs();
   }
 
@@ -265,11 +268,13 @@ export function App() {
       setErr("Paste a provider API key in Settings first.");
       return;
     }
+    if (!settings.model.trim()) { setSetOpen(true); setErr("Choose a model in Settings first."); return; }
     setInput("");
+    setOpenStep(null);
     setBusy(true);
     setErr("");
     try {
-      const res = await fetch("/api/chat", {
+      const res = await request("/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -384,7 +389,7 @@ export function App() {
             {messages.length === 0 && (
               <div className="empty">
                 Ask anything, or drop a file. Answers render as markdown. The right side traces every hop:
-                ingest, embed, MCP connect, LLM HTTP, thinking, tool_use, kb search, and the loop back.
+                network calls, agent steps, tool execution, content ingestion, vector retrieval, and the loop back.
               </div>
             )}
             {messages.map((m) => (
@@ -460,32 +465,11 @@ export function App() {
 
         <section className="pane right">
           <div className="paneHead">
-            Live trace
+            Execution console
             <span>{events.length} steps</span>
           </div>
           <Flow snap={flow} />
-          <div className="timeline" ref={tl}>
-            {events.length === 0 && (
-              <div className="empty">Send a message to see the actual sequence. Click any step to inspect its payload; the diagram follows your selected step.</div>
-            )}
-            {events.map((ev) => (
-              <div key={ev.id}>
-                <div
-                  className={`step${openStep === ev.id ? " on" : ""}`}
-                  onClick={() => setOpenStep(openStep === ev.id ? null : ev.id)}
-                >
-                  <div className="meta">
-                    <div className={`lane ${ev.lane}`}>{ev.lane}</div>
-                    <div>r{ev.round} #{ev.seq}</div>
-                  </div>
-                  <div className="title">{ev.title}</div>
-                </div>
-                {openStep === ev.id && ev.payload !== undefined && (
-                  <pre className="payload">{JSON.stringify(ev.payload, null, 2)}</pre>
-                )}
-              </div>
-            ))}
-          </div>
+          <TraceConsole events={events} selectedId={openStep} onSelect={setOpenStep} />
         </section>
       </div>
 
@@ -554,148 +538,7 @@ export function App() {
         </div>
       )}
 
-      {setOpen && (
-        <div className="modal" onClick={() => setSetOpen(false)}>
-          <div className="card" onClick={(e) => e.stopPropagation()}>
-            <h2>Provider, skills and connections</h2>
-            <p className="empty" style={{ padding: "0 0 14px" }}>
-              Keys stay in memory for this page session and pass through the local API to the selected provider.
-              Settings are saved without keys. Traces redact known credential fields. Retrieved document text is sent
-              to your selected model; enabled MCP connections may contact external services.
-            </p>
-            <div className="field">
-              <label>Provider</label>
-              <select
-                value={settings.provider}
-                onChange={(e) => {
-                  setLiveModels([]);
-                  setSettings((s) => ({
-                    ...s,
-                    provider: e.target.value as LabSettings["provider"],
-                    apiKey: "",
-                    model: (catalog.models[e.target.value] || [])[0] || "",
-                  }));
-                }}
-              >
-                <option value="ollama">Ollama (local, no API key)</option>
-                <option value="anthropic">Anthropic</option>
-                <option value="openai">OpenAI</option>
-                <option value="openrouter">OpenRouter</option>
-                <option value="google">Google Gemini (OpenAI-compat)</option>
-              </select>
-            </div>
-            <div className="field">
-              <label>API key {settings.provider === "ollama" ? "(not required)" : ""}</label>
-              <input
-                type="password"
-                value={settings.apiKey}
-                placeholder="paste key"
-                onChange={(e) => setSettings((s) => ({ ...s, apiKey: e.target.value }))}
-              />
-            </div>
-            <div className="row" style={{ marginBottom: 12 }}>
-              <button onClick={fetchModels}>Load models from provider</button>
-            </div>
-            <div className="field">
-              <label>Model</label>
-              <input aria-label="Model" list="provider-models" value={settings.model} placeholder="Load models or enter a model ID" onChange={(e) => setSettings((s) => ({ ...s, model: e.target.value }))} />
-              <datalist id="provider-models">
-                {models.map((m) => (
-                  <option key={m} value={m}>
-                    {m}
-                  </option>
-                ))}
-              </datalist>
-            </div>
-            <div className="field">
-              <label>
-                <input
-                  type="checkbox"
-                  checked={settings.thinking}
-                  onChange={(e) => setSettings((s) => ({ ...s, thinking: e.target.checked }))}
-                />{" "}
-                Enable thinking (Anthropic extended thinking)
-              </label>
-            </div>
-            <div className="field">
-              <label>Max tool rounds</label>
-              <input
-                type="number"
-                min={1}
-                max={16}
-                value={settings.maxRounds}
-                onChange={(e) => setSettings((s) => ({ ...s, maxRounds: Number(e.target.value) }))}
-              />
-            </div>
-            <h3>Skills</h3>
-            <p>Skills add instructions to the system prompt. They do not grant tools or execute code.</p>
-            {SKILLS.map((skill) => (
-              <label className="mcpRow" key={skill.id}>
-                <input type="checkbox" checked={settings.skills?.includes(skill.id) || false}
-                  onChange={(e) => setSettings((s) => ({ ...s, skills: e.target.checked ? [...(s.skills || []), skill.id] : (s.skills || []).filter((id) => id !== skill.id) }))} />
-                <span><strong>{skill.name}</strong><p>{skill.description}</p></span>
-              </label>
-            ))}
-            <h3 style={{ margin: "8px 0 10px", fontFamily: "var(--display)" }}>Public MCPs</h3>
-            {catalog.mcps.map((p) => {
-              const sel = settings.mcps.find((m) => m.id === p.id) || { id: p.id, enabled: false };
-              return (
-                <div className="mcpRow" key={p.id}>
-                  <input
-                    type="checkbox"
-                    checked={!!sel.enabled}
-                    onChange={(e) =>
-                      setSettings((s) => {
-                        const rest = s.mcps.filter((m) => m.id !== p.id);
-                        return { ...s, mcps: [...rest, { ...sel, id: p.id, enabled: e.target.checked }] };
-                      })
-                    }
-                  />
-                  <div>
-                    <strong>{p.name}</strong>
-                    <p>{p.blurb}</p>
-                    {p.transport === "http" && <p>HTTP {p.url}</p>}
-                    {p.transport === "stdio" && <p>stdio {p.command} {(p.args || []).join(" ")}</p>}
-                  </div>
-                </div>
-              );
-            })}
-            <h3 style={{ margin: "16px 0 10px", fontFamily: "var(--display)" }}>Custom MCP</h3>
-            <div className="mcpRow">
-              <input
-                type="checkbox"
-                checked={!!settings.mcps.find((m) => m.id === "custom")?.enabled}
-                onChange={(e) =>
-                  setSettings((s) => {
-                    const cur = s.mcps.find((m) => m.id === "custom") || { id: "custom", enabled: false, url: "" };
-                    return { ...s, mcps: [...s.mcps.filter((m) => m.id !== "custom"), { ...cur, enabled: e.target.checked }] };
-                  })
-                }
-              />
-              <div style={{ flex: 1 }}>
-                <strong>HTTP / Streamable MCP</strong>
-                <p>Paste any public MCP URL (Streamable HTTP or legacy SSE).</p>
-                <input
-                  style={{ marginTop: 8 }}
-                  placeholder="https://example.com/mcp"
-                  value={settings.mcps.find((m) => m.id === "custom")?.url || ""}
-                  onChange={(e) =>
-                    setSettings((s) => {
-                      const cur = s.mcps.find((m) => m.id === "custom") || { id: "custom", enabled: true, url: "" };
-                      return { ...s, mcps: [...s.mcps.filter((m) => m.id !== "custom"), { ...cur, url: e.target.value, enabled: cur.enabled || true }] };
-                    })
-                  }
-                />
-              </div>
-            </div>
-            <div className="row" style={{ marginTop: 12, justifyContent: "flex-end" }}>
-              <button className="primary" onClick={() => setSetOpen(false)}>
-                Done
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {setOpen && <SettingsDialog settings={settings} setSettings={setSettings} models={models} presets={catalog.mcps} onModels={fetchModels} onEvents={(rows) => setEvents((current) => [...current, ...rows].sort((a, b) => a.t - b.t))} request={request} onClose={() => setSetOpen(false)} />}
     </div>
   );
 }

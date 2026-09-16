@@ -1,3 +1,5 @@
+import { tracedFetch } from "./trace.ts";
+const providerFetch = tracedFetch("ai-provider");
 import type { LabSettings } from "../shared/types.ts";
 import type { BoundTool } from "./mcp.ts";
 import { headersForLog, redact } from "./redact.ts";
@@ -69,7 +71,7 @@ async function anthropic(opts: {
     headers: headersForLog(headers),
     body: redact(body),
   });
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const res = await providerFetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers,
     body: JSON.stringify(body),
@@ -244,7 +246,7 @@ async function openaiCompat(opts: {
     headers: headersForLog(headers),
     body: redact(body),
   });
-  const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  const res = await providerFetch(url, { method: "POST", headers, body: JSON.stringify(body) });
   if (!res.ok || !res.body) {
     const errText = await res.text();
     throw new Error(`${opts.settings.provider} ${res.status}: ${errText.slice(0, 800)}`);
@@ -335,7 +337,7 @@ async function readOpenAiStream(res: Response, onChunk: EmitChunk, log: Log): Pr
 export async function listModels(provider: string, apiKey: string): Promise<string[]> {
   try {
     if (provider === "anthropic") {
-      const res = await fetch("https://api.anthropic.com/v1/models", {
+      const res = await providerFetch("https://api.anthropic.com/v1/models", {
         headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
       });
       if (!res.ok) return [];
@@ -343,7 +345,7 @@ export async function listModels(provider: string, apiKey: string): Promise<stri
       return (json.data || []).map((m) => m.id);
     }
     const base = openaiBase(provider);
-    const res = await fetch(`${base}/models`, {
+    const res = await providerFetch(`${base}/models`, {
       headers: { authorization: `Bearer ${apiKey}` },
     });
     if (!res.ok) return [];

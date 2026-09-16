@@ -1,3 +1,6 @@
+import { withTrace } from "./trace.ts";
+import { connectMcps, closeMcps } from "./mcp.ts";
+import type { TraceMeta, McpSelection } from "../shared/types.ts";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
@@ -31,12 +34,32 @@ app.get("/api/catalog", (c) =>
   }),
 );
 
+async function capture<T>(fn: () => Promise<T>, requestId?: string) {
+  const events: TraceEvent[] = [];
+  const runId = requestId || randomUUID();
+  const result = await withTrace(async (title, payload, meta) => {
+    events.push({ ...meta, runId, id: randomUUID(), t: Date.now(), seq: events.length, round: 0, kind: meta.category === "network" ? "network" : "operation", title, lane: "agent", payload: redact(payload), flow: { nodes: [], edges: [], active: [] } });
+  }, fn);
+  return { result, events };
+}
+
 app.post("/api/models", async (c) => {
   const body = await c.req.json<{ provider: string; apiKey: string }>();
-  const live = (body.apiKey || body.provider === "ollama") ? await listModels(body.provider, body.apiKey) : [];
+  const { result: live, events } = await capture(() => (body.apiKey || body.provider === "ollama") ? listModels(body.provider, body.apiKey) : Promise.resolve([]), c.req.header("x-lab-run-id"));
   const fallback = PROVIDER_MODELS[body.provider] || [];
-  const ids = [...new Set([...live, ...fallback])];
-  return c.json({ models: ids, live: live.length > 0 });
+  return c.json({ models: [...new Set([...live, ...fallback])], live: live.length > 0, events });
+});
+
+app.post("/api/mcp/test", async (c) => {
+  const body = await c.req.json<{ selection: McpSelection }>();
+  if (!body.selection?.id) return c.json({ error: "MCP selection required" }, 400);
+  const logs: { title: string; payload: unknown }[] = [];
+  const { result, events } = await capture(async () => {
+    const connected = await connectMcps([{ ...body.selection, enabled: true }], (title, payload) => { logs.push({ title, payload: redact(payload) }); });
+    try { return { connected: connected.handles.length > 0, tools: connected.tools }; }
+    finally { await closeMcps(connected.handles); }
+  }, c.req.header("x-lab-run-id"));
+  return c.json({ ...result, events, logs });
 });
 
 app.get("/api/chats", async (c) => {
@@ -81,14 +104,17 @@ app.post("/api/kb/upload", async (c) => {
 
   return streamSSE(c, async (stream) => {
     const g = new Graph();
+    const runId = c.req.header("x-lab-run-id") || randomUUID();
     let seq = 0;
     const emit = async (
       kind: string,
       title: string,
       lane: TraceEvent["lane"],
       payload?: unknown,
+      meta: TraceMeta = {},
     ) => {
       const ev: TraceEvent = {
+        runId, category: "knowledge", callType: "local", ...meta,
         id: randomUUID(),
         t: Date.now(),
         seq: seq++,
@@ -102,8 +128,9 @@ app.post("/api/kb/upload", async (c) => {
       await stream.writeSSE({ data: JSON.stringify({ type: "event", event: ev }) });
     };
 
+    await withTrace((title, payload, meta) => emit(meta.category === "network" ? "network" : "operation", title, "kb", payload, meta), async () => {
     try {
-      g.add("user", "Chat", "actor", 0, "upload", 0);
+      g.add("user", "User App", "actor", 0, "upload", 0);
       g.add("agent", "Ingest", "compute", 1, "parse + chunk", 0);
       g.add("embed", "MiniLM", "model", 2, "all-MiniLM-L6-v2", 0);
       g.add("kb", "Local KB", "store", 3, "cosine index", 0);
@@ -140,10 +167,12 @@ app.post("/api/kb/upload", async (c) => {
       });
       await stream.writeSSE({ data: JSON.stringify({ type: "done", doc }) });
     } catch (err) {
+      await emit("kb_error", "Content import failed", "kb", { error: String(err) }, { phase: "error" });
       await stream.writeSSE({
         data: JSON.stringify({ type: "error", message: String(err) }),
       });
     }
+    });
   });
 });
 
@@ -162,6 +191,7 @@ app.post("/api/chat", async (c) => {
     try {
       await runSession({
         chatId,
+        runId: c.req.header("x-lab-run-id"),
         existing,
         userText: body.text.trim(),
         settings: body.settings,

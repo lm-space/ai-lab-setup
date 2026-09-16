@@ -34,14 +34,28 @@ export type ChatMessage = {
   attachments?: { name: string; kind: string }[];
 };
 
-export type TraceEvent = {
+export type TraceCategory = "user-app" | "network" | "agent" | "tools" | "knowledge";
+export type TraceMeta = {
+  category?: TraceCategory;
+  callType?: "ai-provider" | "external" | "local";
+  phase?: "start" | "response" | "complete" | "error" | "info";
+  correlationId?: string;
+  parentId?: string;
+  durationMs?: number;
+  status?: number | string;
+  method?: string;
+  target?: string;
+};
+
+export type TraceEvent = TraceMeta & {
+  runId?: string;
   id: string;
   t: number;
   seq: number;
   round: number;
   kind: string;
   title: string;
-  lane: "parent" | "agent" | "llm" | "mcp" | "kb";
+  lane: "user-app" | "parent" | "agent" | "llm" | "mcp" | "kb";
   detail?: string;
   payload?: unknown;
   flow: FlowSnap;

@@ -1,4 +1,4 @@
-const SECRET = /(api[_-]?key|authorization|x-api-key|token|secret|password|bearer)/i;
+const SECRET = /^(.*api[_-]?key|authorization|x-api-key|.*(?:token|secret|password)|bearer|cookie|set-cookie)$/i;
 
 export function redact(value: unknown): unknown {
   if (value == null) return value;
@@ -16,6 +16,13 @@ export function redact(value: unknown): unknown {
 }
 
 function redactString(s: string): string {
+  if (/^https?:\/\//.test(s)) {
+    try {
+      const url = new URL(s); url.username = ""; url.password = "";
+      for (const key of url.searchParams.keys()) if (SECRET.test(key) || key === "key") url.searchParams.set(key, "[redacted]");
+      return url.toString();
+    } catch { /* fall through for non-URL text */ }
+  }
   if (s.length > 12 && /^(sk-|or-|ya29|AIza|sk-ant-)/.test(s)) return mask(s);
   return s.replace(/(sk-ant-|sk-|or-)[A-Za-z0-9_\-]{8,}/g, (m) => mask(m));
 }
