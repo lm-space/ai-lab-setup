@@ -90,6 +90,7 @@ export type McpPreset = {
 };
 
 export type McpSelection = {
+  allowedTools?: string[];
   id: string;
   enabled: boolean;
   apiKey?: string;

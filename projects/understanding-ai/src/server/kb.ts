@@ -1,3 +1,5 @@
+import { KnowledgeStore } from "./knowledge-store.ts";
+import { DatabaseSync } from "node:sqlite";
 import { trace, tracedOperation } from "./trace.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -28,6 +30,8 @@ type Log = (title: string, payload: unknown) => void | Promise<void>;
 
 let cache: { docs: KbDoc[]; chunks: KbChunk[] } | null = null;
 let extractor: any = null;
+let store: KnowledgeStore;
+let loading: Promise<{ docs: KbDoc[]; chunks: KbChunk[] }> | undefined;
 
 async function ensure() {
   await mkdir(UP, { recursive: true });
@@ -35,19 +39,22 @@ async function ensure() {
 }
 
 async function load() {
-  await ensure();
   if (cache) return cache;
-  cache = {
-    docs: existsSync(DOCS) ? JSON.parse(await readFile(DOCS, "utf8")) : [],
-    chunks: existsSync(CHUNKS) ? JSON.parse(await readFile(CHUNKS, "utf8")) : [],
-  };
-  return cache;
+  return loading ||= (async () => {
+    await ensure();
+    store = new KnowledgeStore(join(ROOT, "knowledge.sqlite"));
+    if (!store.db.prepare("SELECT name FROM migrations WHERE name='json-v1'").get()) {
+      const oldDocs = existsSync(DOCS) ? JSON.parse(await readFile(DOCS, "utf8")) : [];
+      const oldChunks = existsSync(CHUNKS) ? JSON.parse(await readFile(CHUNKS, "utf8")) : [];
+      store.write(oldDocs, oldChunks);
+      store.db.prepare("INSERT INTO migrations VALUES ('json-v1')").run();
+    }
+    cache = store.read();
+    return cache;
+  })();
 }
-
 async function persist() {
-  if (!cache) return;
-  await writeFile(DOCS, JSON.stringify(cache.docs, null, 2), "utf8");
-  await writeFile(CHUNKS, JSON.stringify(cache.chunks), "utf8");
+  if (cache) store.write(cache.docs, cache.chunks);
 }
 
 export async function listDocs(): Promise<KbDoc[]> {
@@ -130,6 +137,7 @@ export async function runKbTool(name: string, input: Record<string, unknown>): P
 
 export function classifyKind(kind: string): Pick<KbDoc, "family" | "label" | "parser" | "shape" | "tools"> {
   const e = kind.toLowerCase().replace(/^\./, "");
+  if (["sqlite", "sqlite3", "db"].includes(e)) return { family: "sheet", label: "SQLite", parser: "SQLite read-only tables", shape: "table", tools: ["kb__table", "kb__search"] };
   if (e === "csv" || e === "xlsx" || e === "xls") {
     return {
       family: "sheet",
@@ -194,6 +202,7 @@ export async function ingestFile(
   const pieces = chunkText(extracted.text, extracted.tables);
   await log("kb_chunked", { fileName, chunks: pieces.length, avgChars: Math.round(pieces.reduce((a, p) => a + p.length, 0) / Math.max(1, pieces.length)) });
 
+  if (!pieces.length) throw new Error("No readable text found. Scanned PDFs need OCR before import.");
   const vectors = await embedAll(pieces, log);
   const { docs, chunks } = await load();
   const chunkRows: KbChunk[] = pieces.map((text, i) => ({
@@ -219,13 +228,13 @@ export async function ingestFile(
   };
   docs.push(doc);
   chunks.push(...chunkRows);
-  await tracedOperation("Write vectors and metadata", { store: "data/kb/chunks.json", chunks: chunkRows.length, dimensions: vectors[0]?.length || 0 }, { category: "knowledge", callType: "local" }, persist);
+  await tracedOperation("Write vectors and metadata", { store: "data/kb/knowledge.sqlite", chunks: chunkRows.length, dimensions: vectors[0]?.length || 0 }, { category: "knowledge", callType: "local" }, persist);
   await log("kb_upsert", {
     id,
     fileName,
     chunks: chunkRows.length,
     dim: vectors[0]?.length || 0,
-    store: "local MiniLM cosine index under data/kb",
+    store: "SQLite + sqlite-vec + FTS5 under data/kb",
   });
   return doc;
 }
@@ -244,17 +253,8 @@ export async function search(query: string, k: number) {
   if (!chunks.length) return { hits: [], note: "knowledge base is empty — upload files first" };
   const [q] = await embedAll([query], (title, payload) => trace(title, payload, { category: "knowledge", callType: "local" }));
   const started = performance.now();
-  const scored = chunks
-    .map((c) => ({
-      id: c.id,
-      name: c.name,
-      i: c.i,
-      score: cosine(q, c.vector),
-      text: c.text.slice(0, 1400),
-    }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, k);
-  await trace("Vector similarity search", { query, scanned: chunks.length, k, hits: scored, algorithm: "cosine similarity over normalized MiniLM vectors", store: "local JSON vector index" }, { category: "knowledge", callType: "local", phase: "complete", durationMs: Math.round(performance.now() - started) });
+  const scored = store.retrieve(query, q, k);
+  await trace("Hybrid retrieval: vector + keyword rank fusion", { query, k, hits: scored, algorithm: "sqlite-vec cosine KNN + SQLite FTS5, reciprocal rank fusion (60)", store: "data/kb/knowledge.sqlite" }, { category: "knowledge", callType: "local", phase: "complete", durationMs: Math.round(performance.now() - started) });
   return { hits: scored };
 }
 
@@ -262,10 +262,10 @@ async function tableQuery(name: string, query: string, limit: number) {
   const { chunks, docs } = await load();
   const doc = docs.find(
     (d) =>
-      ["csv", "xlsx", "xls"].includes(d.kind) &&
+      ["csv", "xlsx", "xls", "sqlite", "sqlite3", "db"].includes(d.kind) &&
       (!name || d.name.toLowerCase().includes(name.toLowerCase())),
   );
-  const pool = chunks.filter((c) => (doc ? c.docId === doc.id : ["csv", "xlsx", "xls"].some((k) => c.name.toLowerCase().endsWith(k))));
+  const pool = chunks.filter((c) => (doc ? c.docId === doc.id : ["csv", "xlsx", "xls", "sqlite", "sqlite3", "db"].some((k) => c.name.toLowerCase().endsWith(k))));
   const q = query.toLowerCase();
   const rows = pool.filter((c) => !q || c.text.toLowerCase().includes(q)).slice(0, limit);
   return {
@@ -282,41 +282,32 @@ function safe(name: string) {
 
 function chunkText(text: string, tables?: string[]): string[] {
   const out: string[] = [];
-  if (tables?.length) out.push(...tables);
-  const clean = text.replace(/\r/g, "").trim();
-  if (!clean) return out.length ? out : [];
-  const size = 900;
-  const overlap = 140;
-  let i = 0;
-  while (i < clean.length) {
-    out.push(clean.slice(i, i + size));
-    i += size - overlap;
+  for (const part of [...(tables || []), text]) {
+    const clean = part.replace(/\r/g, "").trim();
+    for (let i = 0; i < clean.length; i += 760) out.push(clean.slice(i, i + 900));
   }
-  return out.filter((s) => s.trim().length > 20).slice(0, 400);
+  const chunks = out.filter((s) => s.trim().length > 0);
+  if (chunks.length > 400) throw new Error("Content exceeds the 400-chunk demo limit. Split the source into smaller files.");
+  return chunks;
 }
 
-async function extractText(
+export async function extractText(
   fileName: string,
   bytes: Buffer,
   log: Log,
 ): Promise<{ text: string; tables?: string[]; cols?: string[] }> {
   const ext = extname(fileName).toLowerCase();
+  if ([".sqlite", ".sqlite3", ".db"].includes(ext)) {
+    if (bytes.subarray(0, 16).toString() !== "SQLite format 3\0") throw new Error("Not a SQLite database");
+    const path = join(UP, `inspect-${randomUUID()}.sqlite`);
+    await writeFile(path, bytes);
+    try { return inspectSqlite(path); }
+    finally { await (await import("node:fs/promises")).unlink(path); }
+  }
   if (ext === ".md" || ext === ".txt" || ext === ".json") {
     return { text: bytes.toString("utf8") };
   }
-  if (ext === ".csv") {
-    const raw = bytes.toString("utf8");
-    const lines = raw.split(/\r?\n/).filter(Boolean);
-    const header = lines[0] || "";
-    const cols = header.split(",").map((s) => s.trim());
-    await log("kb_parse_csv", { rows: Math.max(0, lines.length - 1), cols });
-    const tables: string[] = [];
-    for (let i = 1; i < lines.length; i += 25) {
-      tables.push(`CSV ${fileName} columns: ${header}\n` + lines.slice(i, i + 25).join("\n"));
-    }
-    return { text: `Spreadsheet ${fileName}\nColumns: ${header}\nRows: ${Math.max(0, lines.length - 1)}`, tables, cols };
-  }
-  if (ext === ".xlsx" || ext === ".xls") {
+  if (ext === ".csv" || ext === ".xlsx" || ext === ".xls") {
     const XLSX = await import("xlsx");
     const wb = XLSX.read(bytes, { type: "buffer" });
     const tables: string[] = [];
@@ -324,12 +315,12 @@ async function extractText(
     const parts: string[] = [];
     for (const sheet of wb.SheetNames) {
       const ws = wb.Sheets[sheet];
-      const csv = XLSX.utils.sheet_to_csv(ws);
-      const lines = csv.split(/\n/).filter(Boolean);
-      if (!cols.length && lines[0]) cols = lines[0].split(",").map((s) => s.trim());
-      parts.push(`# Sheet ${sheet}\n${csv.slice(0, 8000)}`);
-      for (let i = 1; i < lines.length; i += 25) {
-        tables.push(`Excel ${fileName} / ${sheet} header: ${lines[0]}\n` + lines.slice(i, i + 25).join("\n"));
+      const rows = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, defval: "" });
+      const headers = (rows[0] || []).map(String);
+      if (!cols.length) cols = headers;
+      parts.push(`Sheet ${sheet}: ${Math.max(0, rows.length - 1)} rows`);
+      for (let i = 1; i < rows.length; i += 10) {
+        tables.push(`Spreadsheet ${fileName} / ${sheet}\nColumns: ${JSON.stringify(headers)}\nRows: ${JSON.stringify(rows.slice(i, i + 10))}`);
       }
     }
     await log("kb_parse_xlsx", { sheets: wb.SheetNames, cols });
@@ -349,7 +340,7 @@ async function extractText(
       return { text: doc.getBody() };
     } catch (e) {
       await log("kb_parse_doc_failed", { error: String(e) });
-      return { text: "" };
+      throw new Error(`Cannot parse Word document: ${String(e)}`);
     }
   }
   if (ext === ".pdf") {
@@ -396,4 +387,42 @@ function cosine(a: number[], b: number[]) {
   const n = Math.min(a.length, b.length);
   for (let i = 0; i < n; i++) s += a[i] * b[i];
   return s;
+}
+
+export function inspectSqlite(path: string) {
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    db.exec("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;");
+    const names = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND sql NOT LIKE '%VIRTUAL TABLE%' ORDER BY name LIMIT 21").all();
+    if (names.length > 20) throw new Error("SQLite import supports up to 20 tables; export a smaller database.");
+    const tables: string[] = [];
+    for (const entry of names) {
+      const name = String(entry.name);
+      const rows = db.prepare(`SELECT * FROM "${name.replaceAll('"', '""')}" LIMIT 501`).all();
+      if (rows.length > 500) throw new Error(`Table ${name} exceeds 500 rows. Export a smaller dataset for this lab.`);
+      for (const row of rows) tables.push(`Table: ${name}\n${JSON.stringify(row, (_, value) => typeof value === "bigint" ? String(value) : value instanceof Uint8Array ? "[binary data]" : value)}`);
+    }
+    return { text: `SQLite tables: ${names.map(r => r.name).join(", ")}`, tables };
+  } finally { db.close(); }
+}
+
+export async function knowledgeGraph() {
+  const { docs, chunks } = await load();
+  const sample = chunks.slice(0, 100);
+  const edges: { source: string; target: string; similarity: number }[] = [];
+  for (let i = 0; i < sample.length; i++) {
+    const nearest = sample.map((c, j) => ({ j, similarity: cosine(sample[i].vector, c.vector) })).filter(r => r.j > i && r.similarity >= .35).sort((a,b) => b.similarity-a.similarity).slice(0, 2);
+    for (const row of nearest) edges.push({ source: sample[i].id, target: sample[row.j].id, similarity: row.similarity });
+  }
+  return { docs, totalChunks: chunks.length, dimensions: 384, store: "SQLite + sqlite-vec + FTS5", nodes: sample.map(c => ({ id: c.id, docId: c.docId, name: c.name, i: c.i, text: c.text })), edges };
+}
+
+export async function sourceDetails(id: string) {
+  const { docs, chunks } = await load();
+  const doc = docs.find(d => d.id === id);
+  if (!doc) return null;
+  const { resolve, sep } = await import("node:path");
+  const path = resolve(ROOT, doc.path);
+  if (!path.startsWith(resolve(UP) + sep)) throw new Error("Invalid stored source path");
+  return { doc, path, chunks: chunks.filter(c => c.docId === id).map(({ vector, ...chunk }) => ({ ...chunk, dimensions: vector.length })) };
 }

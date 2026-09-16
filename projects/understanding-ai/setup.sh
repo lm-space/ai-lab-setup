@@ -14,7 +14,7 @@ warn() { printf '\033[33m%s\033[0m\n' "$*"; }
 err() { printf '\033[31m%s\033[0m\n' "$*" >&2; }
 prereqs() {
   for tool in node pnpm curl lsof; do command -v "$tool" >/dev/null || { err "Missing prerequisite: $tool"; exit 1; }; done
-  node -e 'const [a,b]=process.versions.node.split(".").map(Number);if(a<22||(a===22&&b<14))process.exit(1)' || { err "Node 22.14+ required"; exit 1; }
+  node -e 'const [a,b]=process.versions.node.split(".").map(Number);if(a<24)process.exit(1)' || { err "Node 24+ required"; exit 1; }
 }
 owned() {
   [ -f "$PID_FILE" ] || return 1

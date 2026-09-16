@@ -17,6 +17,7 @@
     "@hono/node-server": "^1.19.0",
     "@modelcontextprotocol/sdk": "^1.17.5",
     "@xenova/transformers": "^2.17.2",
+    "ajv": "^8.20.0",
     "hono": "^4.9.6",
     "mammoth": "^1.12.2",
     "react": "^19.1.1",
@@ -24,6 +25,7 @@
     "react-markdown": "^10.1.0",
     "rehype-sanitize": "^6.0.0",
     "remark-gfm": "^4.0.1",
+    "sqlite-vec": "^0.1.9",
     "unpdf": "^1.8.1",
     "word-extractor": "^1.0.4",
     "xlsx": "^0.18.5"
@@ -48,6 +50,6 @@
     ]
   },
   "engines": {
-    "node": ">=22.14.0"
+    "node": ">=24.0.0"
   }
 }

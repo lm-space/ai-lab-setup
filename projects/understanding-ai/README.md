@@ -22,7 +22,7 @@ The graph describes this application. It does not reveal ChatGPT's proprietary i
 ./setup.sh setup
 ```
 
-Requires Node 22.14+, pnpm, curl and lsof. Default UI: http://127.0.0.1:4186; API health: http://127.0.0.1:4188/api/health. Configuration is copied from `.env.example` on setup. Change PORT/API_PORT in `.env` if occupied. Setup installs locked dependencies; start resumes existing dependencies; stop preserves local data.
+Requires Node 24+, pnpm, curl and lsof. Default UI: http://127.0.0.1:4186; API health: http://127.0.0.1:4188/api/health. Configuration is copied from `.env.example` on setup. Change PORT/API_PORT in `.env` if occupied. Setup installs locked dependencies; start resumes existing dependencies; stop preserves local data.
 
 ### Ollama
 
@@ -56,10 +56,25 @@ Tests use a local fake HTTP provider to verify adapter behavior without paid req
 
 ## Current limits
 
-Local JSON storage and a file-based vector index are preserved from the source. SQLite migration, durable resumable runs, explicit tool approvals, comprehensive schema validation, budgets/cancellation, curated version-pinned MCP packages and broader live provider conformance are follow-up work. The browser UI and API run together in development mode; `build` validates/builds the UI but is not a hosted deployment package. Native desktop control, autonomous multi-agent scheduling and an installable skill marketplace are not implemented.
+Chats still use local JSON files. Knowledge now uses SQLite, sqlite-vec and FTS5. Durable resumable runs, explicit tool approvals, comprehensive schema validation, budgets/cancellation, curated version-pinned MCP packages and broader live provider conformance are follow-up work. The browser UI and API run together in development mode; `build` validates/builds the UI but is not a hosted deployment package. Native desktop control, autonomous multi-agent scheduling and an installable skill marketplace are not implemented.
 
 ### Observation boundaries
 
 Network timing covers the actual instrumented request: the response row measures time to headers, and completion includes body consumption. Local stdio calls are tool/process operations, not HTTP traffic. The harness cannot observe network calls made internally by remote MCP servers or child processes. Embedding asset lifecycle events are reported by the model library; they are not raw HTTP captures. Server chat traces persist with history; browser navigation, model-discovery, connection-test and standalone upload events are session-console events.
 
 For a synthetic knowledge exercise, import `fixtures/lab-handbook.md` and ask for the mascot name. MiniLM computes real embeddings locally and searches the file-backed vector index. This is not a separately deployed vector database.
+
+
+## Data workspace
+
+Open **Settings → Data** to import MD/TXT, CSV/XLS/XLSX, DOC/DOCX, text-based PDF, JSON, or SQLite snapshots. Two buttons generate synthetic SQLite databases: company policies and a shop with products/orders. Imported databases are read-only; ordinary tables become searchable row chunks. SQLite files must be standalone snapshots (checkpoint WAL before copying). Limits: 20 MB per upload, 20 SQLite tables, 500 rows per table, 400 chunks per document. Oversized sources fail with an explanation; scanned PDFs require external OCR.
+
+Metadata and full extracted chunks persist in `data/kb/knowledge.sqlite`. The [sqlite-vec extension](https://github.com/asg017/sqlite-vec) stores 384-dimensional MiniLM vectors; FTS5 indexes text. Retrieval combines cosine nearest neighbors and keyword matches with reciprocal rank fusion (constant 60). Results expose source/chunk IDs and both ranks. This is a local educational RAG baseline, not an evaluated production-quality guarantee: MiniLM is English-oriented, no cross-encoder reranker or OCR is included, and the graph is not GraphRAG.
+
+The graph displays at most 100 actual chunks in a circular layout, with cosine-similarity edges ≥ 0.35 (up to two later neighbors per chunk). Click nodes or search results to inspect exact stored text. Spatial position does not represent embedding distance. Imports and retrieval feed the Knowledge/All console; MCP tools remain in Connections.
+
+Legacy docs.json/chunks.json migrate once on first load and remain as backups. Removing a source removes its chunks from vector and keyword indexes; original uploads and legacy backup files remain on disk. Node 24+ is required for built-in SQLite with FTS5 (Node 22.14 lacks FTS5). Index updates are transactional; this small-lab implementation rebuilds indexes during writes and is not optimized for large corpora.
+
+## Understand and troubleshoot a run
+
+See [Observability walkthrough and flow diagrams](docs/observability.md) for a hands-on demo, request/tool/RAG diagrams, console categories, precise timing and tokens/sec definitions, and failure/visibility boundaries.

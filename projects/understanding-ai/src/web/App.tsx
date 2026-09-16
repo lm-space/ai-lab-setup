@@ -1,3 +1,4 @@
+import { RequestStatus, type RequestRun } from "./RequestStatus";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Flow } from "./Flow";
 import { SettingsDialog } from "./SettingsDialog";
@@ -16,7 +17,7 @@ import type {
 } from "../shared/types";
 
 const SETTINGS_KEY = "understanding-ai-settings";
-const ACCEPT = ".md,.txt,.pdf,.doc,.docx,.csv,.xls,.xlsx,.json";
+const ACCEPT = ".sqlite,.sqlite3,.db,.md,.txt,.pdf,.doc,.docx,.csv,.xls,.xlsx,.json";
 
 const emptySettings = (): LabSettings => ({
   provider: "ollama",
@@ -36,22 +37,23 @@ async function readSse(
   const reader = res.body.getReader();
   const dec = new TextDecoder();
   let buf = "";
+  let terminal = false;
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
     buf += dec.decode(value, { stream: true });
+    buf = buf.replace(/\r\n/g, "\n");
     const chunks = buf.split("\n\n");
     buf = chunks.pop() || "";
     for (const chunk of chunks) {
       const line = chunk.split("\n").find((l) => l.startsWith("data:"));
       if (!line) continue;
-      try {
-        onFrame(JSON.parse(line.slice(5).trim()) as SseFrame);
-      } catch {
-        /* skip truncated json */
-      }
+      const frame = JSON.parse(line.slice(5).trim()) as SseFrame;
+      if (frame.type === "done" || frame.type === "error") terminal = true;
+      onFrame(frame);
     }
   }
+  if (!terminal) throw new Error("Connection closed before completion. The response may be incomplete; check Network and retry.");
 }
 
 export function App() {
@@ -74,6 +76,7 @@ export function App() {
   const [openStep, setOpenStep] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [run, setRun] = useState<RequestRun | null>(null);
   const [err, setErr] = useState("");
   const [histOpen, setHistOpen] = useState(false);
   const [setOpen, setSetOpen] = useState(false);
@@ -182,6 +185,7 @@ export function App() {
       if (frame.chatId) setChatId(frame.chatId);
     } else if (frame.type === "error") {
       setErr(frame.message);
+      setMessages((rows) => rows.filter((m) => m.role !== "assistant" || m.content.trim()));
     }
   }
 
@@ -230,7 +234,7 @@ export function App() {
     }
   }
 
-  async function ingestFiles(files: FileList | File[]) {
+  async function ingestFiles(files: FileList | File[], reportFailure = false) {
     const list = Array.from(files);
     if (!list.length) return;
     setBusy(true);
@@ -245,11 +249,14 @@ export function App() {
           const j = await res.json().catch(() => ({ error: res.statusText }));
           throw new Error(j.error || "upload failed");
         }
-        await readSse(res, applyFrame);
+        let failure = "";
+        await readSse(res, frame => { applyFrame(frame); if (frame.type === "error") failure = frame.message; });
+        if (failure) throw new Error(failure);
       }
       await refreshDocs();
     } catch (e) {
       setErr(String(e));
+      if (reportFailure) throw e;
     } finally {
       setBusy(false);
     }
@@ -273,16 +280,14 @@ export function App() {
     setOpenStep(null);
     setBusy(true);
     setErr("");
+    setRun({ startedAt: Date.now(), lastActivity: Date.now(), endedAt: null, error: "", hasOutput: false });
     try {
       const res = await request("/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           chatId,
-          text:
-            docs.length > 0
-              ? `${text}\n\n[Local KB files available via kb__search / kb__list / kb__table: ${docs.map((d) => d.name).join(", ")}]`
-              : text,
+          text,
           settings,
         }),
       });
@@ -290,11 +295,19 @@ export function App() {
         const error = await res.json();
         throw new Error(error.error || "Request failed");
       }
-      await readSse(res, applyFrame);
+      await readSse(res, frame => {
+        applyFrame(frame);
+        setRun(current => current ? { ...current, lastActivity: Date.now(),
+          hasOutput: current.hasOutput || (frame.type === "chat" && frame.role === "assistant" && !!frame.delta),
+          error: frame.type === "error" ? frame.message : current.error } : current);
+      });
     } catch (e) {
       setErr(String(e));
+      setRun(current => current ? { ...current, error: String(e) } : current);
+      setMessages(rows => rows.filter(m => m.role !== "assistant" || m.content.trim()));
     } finally {
       setBusy(false);
+      setRun(current => current ? { ...current, endedAt: Date.now() } : current);
     }
   }
 
@@ -395,12 +408,13 @@ export function App() {
             {messages.map((m) => (
               <div key={m.id} className={`bubble ${m.role}`}>
                 <div className="who">{m.role}</div>
-                {m.role === "assistant" ? <Markdown text={m.content} /> : <Markdown text={m.content} />}
+                {m.role === "assistant" ? (m.content ? <Markdown text={m.content} /> : <span className="waitingText">Waiting for model output…</span>) : <Markdown text={m.content} />}
               </div>
             ))}
             <div ref={bottom} />
           </div>
-          {err ? <div className="err">{err}</div> : null}
+          {run && <RequestStatus run={run} events={events} />}
+          {err ? <div role="alert" className="err">{err}</div> : null}
           {docs.length > 0 && (
             <div className="chips">
               {docs.slice(0, 8).map((d) => (
@@ -454,7 +468,7 @@ export function App() {
                     />
                   </svg>
                 </button>
-                <span className="hint">md · pdf · docx · csv · xlsx → local MiniLM index</span>
+                <span className="hint">md · pdf · docx · csv · xlsx → SQLite + MiniLM</span>
                 <button type="button" className="sendBtn" disabled={busy || !input.trim()} onClick={send}>
                   {busy ? "…" : "Send"}
                 </button>
@@ -468,7 +482,7 @@ export function App() {
             Execution console
             <span>{events.length} steps</span>
           </div>
-          <Flow snap={flow} />
+          <Flow snap={flow} events={events} selectedId={openStep} onSelect={setOpenStep} />
           <TraceConsole events={events} selectedId={openStep} onSelect={setOpenStep} />
         </section>
       </div>
@@ -508,7 +522,7 @@ export function App() {
             <div className="storeMap">
               <div><code>uploads/</code> original files</div>
               <div><code>docs.json</code> classified catalog</div>
-              <div><code>chunks.json</code> 384-d cosine index</div>
+              <div><code>knowledge.sqlite</code> sqlite-vec + FTS5</div>
               <div><code>models/</code> MiniLM weights (local)</div>
             </div>
             <button className="primary libUpload" onClick={() => fileRef.current?.click()}>
@@ -538,7 +552,7 @@ export function App() {
         </div>
       )}
 
-      {setOpen && <SettingsDialog settings={settings} setSettings={setSettings} models={models} presets={catalog.mcps} onModels={fetchModels} onEvents={(rows) => setEvents((current) => [...current, ...rows].sort((a, b) => a.t - b.t))} request={request} onClose={() => setSetOpen(false)} />}
+      {setOpen && <SettingsDialog onImport={(files) => ingestFiles(files, true)} onRefresh={refreshDocs} busy={busy} settings={settings} setSettings={setSettings} models={models} presets={catalog.mcps} onModels={fetchModels} onEvents={(rows) => setEvents((current) => [...current, ...rows].sort((a, b) => a.t - b.t))} request={request} onClose={() => setSetOpen(false)} />}
     </div>
   );
 }

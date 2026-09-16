@@ -27,10 +27,30 @@ export async function runLlm(opts: {
   onChunk: EmitChunk;
   log: Log;
 }): Promise<LlmTurn> {
-  if (opts.settings.provider === "anthropic") {
-    return anthropic(opts);
+  const started = performance.now();
+  let firstOutputMs: number | null = null;
+  let firstTextMs: number | null = null;
+  const onChunk: EmitChunk = (kind, delta) => {
+    if (delta && firstOutputMs === null) firstOutputMs = performance.now() - started;
+    if (delta && kind === "text" && firstTextMs === null) firstTextMs = performance.now() - started;
+    opts.onChunk(kind, delta);
+  };
+  try {
+    const turn = await (opts.settings.provider === "anthropic" ? anthropic({ ...opts, onChunk }) : openaiCompat({ ...opts, onChunk }));
+    const durationMs = performance.now() - started;
+    const usage = turn.usage as Record<string, number> | undefined;
+    const inputTokens = usage?.input_tokens ?? usage?.prompt_tokens ?? null;
+    const outputTokens = usage?.output_tokens ?? usage?.completion_tokens ?? null;
+    await opts.log("Model request metrics", { durationMs, firstOutputMs, firstTextMs, inputTokens, outputTokens,
+      tokensPerSecond: outputTokens === null ? null : outputTokens / (durationMs / 1000),
+      rateDefinition: "Provider-reported output tokens divided by full model request seconds, including initial wait. Not a decoder-only speed.",
+      textCharacters: turn.text.length, status: "complete" });
+    return turn;
+  } catch (error) {
+    if (error instanceof Error && error.name === "TimeoutError") error = new Error("The model did not complete within 120 seconds. It may be loading, overloaded, or unreachable. Check the provider and retry.");
+    await opts.log("Model request failed", { durationMs: performance.now() - started, firstOutputMs, firstTextMs, status: "error", error: String(error) });
+    throw error;
   }
-  return openaiCompat(opts);
 }
 
 function anthropicTools(tools: BoundTool[]) {
@@ -74,6 +94,7 @@ async function anthropic(opts: {
   const res = await providerFetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers,
+    signal: AbortSignal.timeout(120_000),
     body: JSON.stringify(body),
   });
   if (!res.ok || !res.body) {
@@ -103,6 +124,7 @@ async function readAnthropicStream(
   const reader = res.body!.getReader();
   const dec = new TextDecoder();
   let buf = "";
+  let completed = false;
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -121,6 +143,8 @@ async function readAnthropicStream(
         } catch {
           continue;
         }
+        if (json.type === "error") throw new Error(`Provider stream error: ${JSON.stringify(json.error)}`);
+        if (json.type === "message_stop") completed = true;
         turn.rawEvents.push({ event, data: json });
         if (json.type === "content_block_start") {
           blockType = json.content_block?.type || "";
@@ -154,13 +178,14 @@ async function readAnthropicStream(
           }
         } else if (json.type === "message_delta") {
           turn.stopReason = json.delta?.stop_reason || turn.stopReason;
-          if (json.usage) turn.usage = json.usage;
+          if (json.usage) turn.usage = { ...(turn.usage as object || {}), ...json.usage };
         } else if (json.type === "message_start" && json.message?.usage) {
           turn.usage = json.message.usage;
         }
       }
     }
   }
+  if (!completed) throw new Error("Provider stream ended before message_stop. The response is incomplete.");
   for (const [idx, slot] of Object.entries(tools)) {
     let input: Record<string, unknown> = {};
     try {
@@ -226,6 +251,7 @@ async function openaiCompat(opts: {
   const body: Record<string, unknown> = {
     model: opts.settings.model,
     stream: true,
+    stream_options: { include_usage: true },
     messages,
   };
   if (opts.tools.length) {
@@ -246,7 +272,7 @@ async function openaiCompat(opts: {
     headers: headersForLog(headers),
     body: redact(body),
   });
-  const res = await providerFetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  const res = await providerFetch(url, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(120_000) });
   if (!res.ok || !res.body) {
     const errText = await res.text();
     throw new Error(`${opts.settings.provider} ${res.status}: ${errText.slice(0, 800)}`);
@@ -261,6 +287,7 @@ async function readOpenAiStream(res: Response, onChunk: EmitChunk, log: Log): Pr
   const reader = res.body!.getReader();
   const dec = new TextDecoder();
   let buf = "";
+  let completed = false;
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -270,13 +297,15 @@ async function readOpenAiStream(res: Response, onChunk: EmitChunk, log: Log): Pr
     for (const line of parts) {
       if (!line.startsWith("data:")) continue;
       const data = line.slice(5).trim();
-      if (!data || data === "[DONE]") continue;
+      if (data === "[DONE]") { completed = true; continue; }
+      if (!data) continue;
       let json: any;
       try {
         json = JSON.parse(data);
       } catch {
         continue;
       }
+      if (json.error) throw new Error(`Provider stream error: ${JSON.stringify(json.error)}`);
       turn.rawEvents.push(json);
       const choice = json.choices?.[0];
       const delta = choice?.delta || {};
@@ -298,9 +327,10 @@ async function readOpenAiStream(res: Response, onChunk: EmitChunk, log: Log): Pr
         }
       }
       if (choice?.finish_reason) turn.stopReason = choice.finish_reason;
-      if (json.usage) turn.usage = json.usage;
+      if (json.usage) turn.usage = { ...(turn.usage as object || {}), ...json.usage };
     }
   }
+  if (!completed) throw new Error("Provider stream ended before [DONE]. The response is incomplete.");
   for (const slot of Object.values(tools)) {
     let input: Record<string, unknown> = {};
     try {
@@ -354,4 +384,19 @@ export async function listModels(provider: string, apiKey: string): Promise<stri
   } catch {
     return [];
   }
+}
+
+/** Inspect the installed model, rather than guessing capabilities from its name. */
+export async function modelCapabilities(settings: LabSettings): Promise<string[] | null> {
+  if (settings.provider !== "ollama") return null;
+  const base = (process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/$/, "");
+  const res = await providerFetch(`${base}/api/show`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: settings.model }), signal: AbortSignal.timeout(15000),
+  });
+  if (!res.ok) throw new Error(`Cannot inspect Ollama model ${settings.model}: HTTP ${res.status}. Load an installed chat model in Settings.`);
+  const data = await res.json() as { capabilities?: string[] };
+  if (!Array.isArray(data.capabilities)) throw new Error("Ollama did not report model capabilities. Update Ollama and try again.");
+  if (!data.capabilities.includes("completion")) throw new Error(`${settings.model} is not a chat model. Choose a model with completion support.`);
+  return data.capabilities;
 }

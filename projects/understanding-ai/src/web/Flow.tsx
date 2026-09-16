@@ -1,112 +1,51 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { FlowSnap } from "../shared/types";
+import { useEffect, useRef, useState } from "react";
+import type { FlowSnap, TraceEvent } from "../shared/types";
+import { categoryOf } from "../shared/trace-view";
 
-const KIND_COLOR: Record<string, string> = {
-  compute: "#9ccb8a",
-  model: "#b9a1e8",
-  data: "#4fd8eb",
-  store: "#e3a23c",
-  actor: "#7fb2e8",
-  external: "#8c99ab",
-};
+const lanes = ["User App", "Agent", "AI provider", "Tools / MCP", "Knowledge", "Local / external HTTP"];
+function lane(event: TraceEvent) {
+  if (event.category === "network") return event.callType === "ai-provider" ? 2 : 5;
+  if (event.lane === "llm") return 2;
+  const category = categoryOf(event);
+  return category === "user-app" ? 0 : category === "tools" ? 3 : category === "knowledge" ? 4 : 1;
+}
 
-type Pos = { x: number; y: number; w: number; h: number };
-
-export function Flow({ snap }: { snap: FlowSnap | null }) {
-  const wrap = useRef<HTMLDivElement>(null);
-  const [size, setSize] = useState({ w: 800, h: 280 });
-
-  useEffect(() => {
-    const el = wrap.current;
-    if (!el) return;
-    const ro = new ResizeObserver(() => setSize({ w: el.clientWidth, h: el.clientHeight }));
-    ro.observe(el);
-    setSize({ w: el.clientWidth, h: el.clientHeight });
-    return () => ro.disconnect();
-  }, []);
-
-  const layout = useMemo(() => {
-    const nodes = (snap?.nodes || []).map((node) => node.id === "user" ? { ...node, label: "User App" } : node);
-    const maxCol = Math.max(0, ...nodes.map((n) => n.col));
-    const maxRow = Math.max(0, ...nodes.map((n) => n.row));
-    const padX = 24;
-    const padY = 28;
-    const nw = 128;
-    const nh = 52;
-    const usableW = Math.max(size.w - padX * 2, 400);
-    const usableH = Math.max(size.h - padY * 2, 160);
-    const gapX = maxCol === 0 ? 0 : (usableW - nw) / maxCol;
-    const gapY = maxRow === 0 ? 0 : (usableH - nh) / maxRow;
-    const pos = new Map<string, Pos>();
-    const nextRow = new Map<number, number>();
-    for (const n of nodes) {
-      const row = Math.max(n.row, nextRow.get(n.col) || 0);
-      nextRow.set(n.col, row + 1);
-      pos.set(n.id, {
-        x: padX + n.col * gapX,
-        y: padY + row * Math.max(gapY, 64),
-        w: nw,
-        h: nh,
-      });
-    }
-    const height = Math.max(size.h, ...[...pos.values()].map((p) => p.y + p.h + padY));
-    return { pos, nw, nh, height };
-  }, [snap, size]);
-
-  if (!snap || snap.nodes.length === 0) {
-    return (
-      <div className="flowWrap" ref={wrap}>
-        <div className="empty">The flow appears as you upload a file or send a question.</div>
-      </div>
-    );
+export function Flow({ snap, events, selectedId, onSelect }: { snap: FlowSnap | null; events: TraceEvent[]; selectedId: string | null; onSelect: (id: string) => void }) {
+  const [expanded, setExpanded] = useState(false);
+  const [zoom, setZoom] = useState(100);
+  const [filter, setFilter] = useState("");
+  const [inspect, setInspect] = useState<TraceEvent | null>(null);
+  const dialog = useRef<HTMLDialogElement>(null);
+  useEffect(() => { if (expanded) dialog.current?.showModal(); else dialog.current?.close(); }, [expanded]);
+  const selected = events.find(e => e.id === selectedId);
+  const latest = [...events].reverse().find(e => e.flow.nodes.length);
+  const runId = selected?.runId || latest?.runId;
+  const rows = events.filter(e => !runId || e.runId === runId).filter(e => !filter || `${e.title} ${e.target || ""} ${e.detail || ""}`.toLowerCase().includes(filter.toLowerCase()));
+  const first = rows[0]?.t || 0;
+  function sequence() {
+    return <div className="sequenceScroll"><div className="sequenceDiagram" style={{ minWidth: `${1120 * zoom / 100}px` }}>
+      <div className="sequenceHeader"><span>Elapsed</span>{lanes.map(name => <strong key={name}>{name}</strong>)}</div>
+      {rows.map((event, index) => <div className={`sequenceRow ${event.id === selectedId ? "selected" : ""}`} key={event.id}>
+        <div className="sequenceTime"><span>{index + 1}</span><small>+{((event.t - first) / 1000).toFixed(3)}s</small></div>
+        {lanes.map((name, column) => <div className="sequenceCell" key={name}>{column === lane(event) && <button className={`sequenceEvent ${event.phase === "error" ? "failed" : ""}`} onClick={() => { onSelect(event.id); setInspect(event); }}>
+          <small>{event.callType || categoryOf(event)} · {event.phase || event.kind}{event.round > 0 ? ` · round ${event.round}` : ""}</small>
+          <strong>{event.title}</strong>{event.target && <span>{event.target}</span>}
+          {event.durationMs != null && <small>{event.durationMs.toFixed(1)} ms{event.status ? ` · ${event.status}` : ""}</small>}
+        </button>}</div>)}
+      </div>)}
+      {!rows.length && <p className="empty">Send a question or import data to see observed execution stages.</p>}
+    </div></div>;
   }
-
-  return (
-    <div className="flowWrap" ref={wrap}>
-      <svg className="flowSvg" style={{ height: layout.height, position: "relative", display: "block" }} viewBox={`0 0 ${size.w} ${layout.height}`}>
-        {snap.edges.map((e, i) => {
-          const a = layout.pos.get(e.from);
-          const b = layout.pos.get(e.to);
-          if (!a || !b) return null;
-          const x1 = a.x + a.w;
-          const y1 = a.y + a.h / 2;
-          const x2 = b.x;
-          const y2 = b.y + b.h / 2;
-          const mx = (x1 + x2) / 2;
-          const d = `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`;
-          const anim = e.animated !== false;
-          return (
-            <g key={i}>
-              <path className={anim ? "e anim" : "e"} d={d} />
-              <text className="elab" x={mx} y={(y1 + y2) / 2 - 6} textAnchor="middle">
-                {e.label}
-              </text>
-            </g>
-          );
-        })}
-        {snap.nodes.map((n) => {
-          const p = layout.pos.get(n.id);
-          if (!p) return null;
-          const hot = snap.active.includes(n.id);
-          const fill = KIND_COLOR[n.kind] || "#8c99ab";
-          return (
-            <g key={n.id} transform={`translate(${p.x},${p.y})`}>
-              <rect className={`node k-${n.kind}${hot ? " hot" : ""}`} width={p.w} height={p.h} rx={6} />
-              <text className="nk" x={10} y={14} fill={fill}>
-                {n.kind}
-              </text>
-              <text className="nlabel" x={10} y={30}>
-                {(n.id === "user" ? "User App" : n.label).slice(0, 18)}
-              </text>
-              {n.sub ? (
-                <text className="nsub" x={10} y={44}>
-                  {n.sub.slice(0, 28)}
-                </text>
-              ) : null}
-            </g>
-          );
-        })}
-      </svg>
+  return <>
+    <div className="flowWrap sequencePreview">
+      <div className="flowToolbar"><strong>Execution flow · {rows.length} events</strong><button onClick={() => setExpanded(true)}>⛶ Fullscreen flow</button></div>
+      {sequence()}
     </div>
-  );
+    <dialog ref={dialog} className="flowDialog" aria-labelledby="flow-title" onCancel={() => setExpanded(false)}>
+      <header className="flowToolbar"><div><h2 id="flow-title">Execution flow</h2><p>Read top to bottom. Each row is an observed event; columns identify the responsible layer.</p></div><button aria-label="Close fullscreen flow" onClick={() => setExpanded(false)}>Close ×</button></header>
+      <div className="flowToolbar"><input aria-label="Filter flow events" placeholder="Filter events or endpoints…" value={filter} onChange={e => setFilter(e.target.value)} /><label>Diagram width <select value={zoom} onChange={e => setZoom(Number(e.target.value))}><option value={80}>Compact</option><option value={100}>Normal</option><option value={140}>Wide</option></select></label><span>{rows.length} events · {snap?.nodes.find(n => n.id === "llm")?.sub || "Observed run"}</span></div>
+      {sequence()}
+      {inspect && <aside className="flowDetails"><div className="flowToolbar"><strong>{inspect.title}</strong><button onClick={() => setInspect(null)}>Close details</button></div><p>Run: {inspect.runId || "legacy"} · Call: {inspect.correlationId || "—"} · Parent: {inspect.parentId || "—"}</p><pre>{JSON.stringify(inspect.payload, null, 2)}</pre></aside>}
+    </dialog>
+  </>;
 }

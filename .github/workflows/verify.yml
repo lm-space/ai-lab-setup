@@ -15,7 +15,7 @@ jobs:
           package_json_file: projects/understanding-ai/package.json
       - uses: actions/setup-node@v4
         with:
-          node-version: '22.14.0'
+          node-version: '24.0.0'
           cache: pnpm
           cache-dependency-path: projects/understanding-ai/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile

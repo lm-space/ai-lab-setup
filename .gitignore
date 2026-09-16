@@ -12,3 +12,7 @@ artifacts/
 # Local planning and inspiration notes (any directory)
 idea.md
 inspirations.md
+projects/ignore/
+
+# Agent planning notes (local only)
+ignore/

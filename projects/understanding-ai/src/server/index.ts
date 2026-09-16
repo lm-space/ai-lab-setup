@@ -1,3 +1,6 @@
+import { previewSource } from "./source-view.ts";
+import { readFile } from "node:fs/promises";
+import { sampleDatabase } from "./data-samples.ts";
 import { withTrace } from "./trace.ts";
 import { connectMcps, closeMcps } from "./mcp.ts";
 import type { TraceMeta, McpSelection } from "../shared/types.ts";
@@ -8,16 +11,22 @@ import { streamSSE } from "hono/streaming";
 import { randomUUID } from "node:crypto";
 import { Graph, runSession } from "./agent.ts";
 import { MCP_PRESETS, PROVIDER_MODELS } from "./catalog.ts";
-import { deleteDoc, ingestFile, kbTools, listDocs } from "./kb.ts";
+import { deleteDoc, ingestFile, kbTools, listDocs, knowledgeGraph, search, sourceDetails } from "./kb.ts";
 import { listModels } from "./providers.ts";
 import { redact } from "./redact.ts";
 import { listChats, loadChat } from "./store.ts";
 import type { LabSettings, TraceEvent } from "../shared/types.ts";
 
 const PORT = Number(process.env.API_PORT || 4188);
-const ALLOWED = new Set(["md", "txt", "pdf", "doc", "docx", "csv", "xls", "xlsx", "json"]);
+const ALLOWED = new Set(["md", "txt", "pdf", "doc", "docx", "csv", "xls", "xlsx", "json", "sqlite", "sqlite3", "db"]);
 
 const app = new Hono();
+app.use("/api/*", async (c, next) => {
+  const origin = c.req.header("origin");
+  const allowed = [`http://127.0.0.1:${process.env.PORT || 4186}`, `http://localhost:${process.env.PORT || 4186}`];
+  if (origin && !allowed.includes(origin)) return c.json({ error: "Untrusted browser origin" }, 403);
+  await next();
+});
 app.use("/api/*", cors({ origin: [`http://127.0.0.1:${process.env.PORT || 4186}`, `http://localhost:${process.env.PORT || 4186}`] }));
 
 app.get("/api/health", (c) => c.json({ ok: true }));
@@ -86,6 +95,36 @@ app.get("/api/chats/:id", async (c) => {
 
 app.get("/api/kb", async (c) => c.json({ docs: await listDocs() }));
 
+app.get("/api/data/source/:id", async (c) => {
+  const source = await sourceDetails(c.req.param("id"));
+  if (!source) return c.json({ error: "Source not found" }, 404);
+  try { return c.json({ doc: source.doc, chunks: source.chunks, ...await previewSource(source.path, source.doc.name) }); }
+  catch (error) { return c.json({ error: `Cannot read original source: ${String(error)}` }, 422); }
+});
+app.get("/api/data/source/:id/original", async (c) => {
+  const source = await sourceDetails(c.req.param("id"));
+  if (!source) return c.json({ error: "Source not found" }, 404);
+  const pdf = source.doc.kind === "pdf";
+  return c.body(new Uint8Array(await readFile(source.path)), 200, {
+    "Content-Type": pdf ? "application/pdf" : "application/octet-stream",
+    "Content-Disposition": `${pdf ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(source.doc.name)}`,
+    "X-Content-Type-Options": "nosniff",
+  });
+});
+
+app.get("/api/data", async (c) => c.json(await knowledgeGraph()));
+app.get("/api/data/sample/:kind", async (c) => {
+  const kind = c.req.param("kind");
+  if (!["policies", "shop"].includes(kind)) return c.json({ error: "Unknown sample" }, 400);
+  return c.body(new Uint8Array(await sampleDatabase(kind)), 200, { "Content-Type": "application/vnd.sqlite3" });
+});
+app.post("/api/data/search", async (c) => {
+  const body = await c.req.json<{ query: string }>();
+  if (!body.query?.trim()) return c.json({ error: "Enter a search query" }, 400);
+  const { result, events } = await capture(() => search(body.query.trim(), 6), c.req.header("x-lab-run-id"));
+  return c.json({ ...result, events });
+});
+
 app.delete("/api/kb/:id", async (c) => {
   await deleteDoc(c.req.param("id"));
   return c.json({ ok: true, docs: await listDocs() });
@@ -100,6 +139,7 @@ app.post("/api/kb/upload", async (c) => {
   if (!ALLOWED.has(ext)) {
     return c.json({ error: `unsupported type .${ext}. Use md, pdf, doc, docx, csv, xls, xlsx.` }, 400);
   }
+  if (file.size > 20 * 1024 * 1024) return c.json({ error: "Maximum upload size is 20 MB" }, 413);
   const buf = Buffer.from(await file.arrayBuffer());
 
   return streamSSE(c, async (stream) => {
@@ -215,7 +255,7 @@ function humanIngest(kind: string): string {
     kb_chunked: "Split into overlapping chunks",
     kb_embed_start: "Loading local MiniLM embedder (first run downloads the model)",
     kb_embed_done: "Embedded chunks into 384-d vectors",
-    kb_upsert: "Upserted vectors into the on-disk cosine index",
+    kb_upsert: "Stored chunks in SQLite, sqlite-vec and FTS5",
     kb_parse_csv: "Parsed CSV header + rows",
     kb_parse_xlsx: "Parsed Excel sheets to row chunks",
     kb_parse_docx: "Extracted Word document text",
